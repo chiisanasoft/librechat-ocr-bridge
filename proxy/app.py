@@ -529,6 +529,19 @@ async def list_models(request: Request) -> Response:
     return JSONResponse(data, status_code=r.status_code)
 
 
+async def list_tags(request: Request) -> Response:
+    """Ollama-native model list; LibreChat uses this for endpoints named "Ollama"."""
+    r = await client.get(f"{UPSTREAM}/api/tags", headers=forward_headers(request))
+    data = r.json()
+    data.setdefault("models", []).append({
+        "name": formatter.FORMAT_MODEL_NAME, "model": formatter.FORMAT_MODEL_NAME,
+        "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "size": 0, "digest": "",
+        "details": {"format": "workflow", "family": "ocr-bridge", "families": ["ocr-bridge"],
+                    "parameter_size": "", "quantization_level": ""},
+    })
+    return JSONResponse(data, status_code=r.status_code)
+
+
 async def any_route(request: Request) -> Response:
     return await passthrough(request, await request.body())
 
@@ -553,5 +566,6 @@ app = Starlette(routes=[
     Route("/exports/{token}/{name}", download, methods=["GET"]),
     Route("/v1/chat/completions", chat_completions, methods=["POST"]),
     Route("/v1/models", list_models, methods=["GET"]),
+    Route("/api/tags", list_tags, methods=["GET"]),
     Route("/{path:path}", any_route, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
 ])
