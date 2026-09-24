@@ -154,7 +154,7 @@ async def reshape_batch(client, upstream: str, headers: dict, template: list[str
             f"入力の列（見出しは推定）: {json.dumps(source_columns, ensure_ascii=False)}\n"
             f"入力行:\n" + "\n".join(lines))
     req = {"model": FORMAT_LLM, "stream": False, "think": False, "format": row_schema(template),
-           "options": {"temperature": 0, "num_ctx": 8192},
+           "options": {"temperature": 0},  # context size comes from the model's num_ctx
            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]}
     r = await client.post(f"{upstream}/api/chat", json=req, headers=headers)
     r.raise_for_status()
