@@ -16,17 +16,24 @@ to loop (e.g. ": [table]: [table]...") after finishing a page. HTML tables in
 OCR output are converted to Markdown tables and, for OCR models, also exported
 as an .xlsx workbook served from /exports/ with a download link in the reply.
 
+The virtual model FORMAT_MODEL_NAME ("ocr-format") runs a fixed workflow:
+OCR every page -> merge into one table -> reshape to a column template with
+FORMAT_LLM -> rule-based normalization and checks -> one table + Excel.
+
 Everything else is passed through unchanged (including streaming).
 """
 
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
+from typing import AsyncIterator, Callable
 from urllib.parse import quote
 
 import fitz  # PyMuPDF
@@ -36,6 +43,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+import formatter
 import tables
 
 UPSTREAM = os.environ.get("OLLAMA_UPSTREAM", "http://host.docker.internal:11434").rstrip("/")
@@ -123,7 +131,7 @@ async def pdf_to_text(pdf: bytes, filename: str, pages_wanted: list[int] | None,
                 img = {"type": "image_url",
                        "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}}
                 log.info("OCR fallback page=%d model=%s prompt=%r", i + 1, OCR_FALLBACK_MODEL, prompt)
-                text = "".join([t async for t in ocr_page(OCR_FALLBACK_MODEL, img, prompt, headers, {})])
+                text = await ocr_text(OCR_FALLBACK_MODEL, img, prompt, headers, {})
                 text, _ = tables.convert_html_tables(text)
             pages.append(f"--- Page {i + 1} ---\n{text.strip()}")
     return f'File: "{filename}"\n\n' + "\n\n".join(pages)
@@ -291,6 +299,24 @@ async def ocr_page(model: str, img: dict, prompt: str, headers: dict, usage: dic
         yield text[sent:]
 
 
+_ocr_cache: OrderedDict[str, str] = OrderedDict()
+OCR_CACHE_SIZE = 64
+
+
+async def ocr_text(model: str, img: dict, prompt: str, headers: dict, usage: dict) -> str:
+    """Full OCR text for one image. Cached, since LibreChat resends attachments on every turn."""
+    key = hashlib.sha256(f"{model}\0{prompt}\0{img['image_url']['url']}".encode()).hexdigest()
+    if key in _ocr_cache:
+        _ocr_cache.move_to_end(key)
+        return _ocr_cache[key]
+    text = "".join([t async for t in ocr_page(model, img, prompt, headers, usage)])
+    if not text.startswith("[OCR error"):
+        _ocr_cache[key] = text
+        if len(_ocr_cache) > OCR_CACHE_SIZE:
+            _ocr_cache.popitem(last=False)
+    return text
+
+
 def chunk(cid: str, model: str, delta: dict, finish: str | None = None) -> str:
     obj = {
         "id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
@@ -299,7 +325,7 @@ def chunk(cid: str, model: str, delta: dict, finish: str | None = None) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def export_xlsx(source: str, sheets: list[tuple[str, tables.Table]]) -> str:
+def export_xlsx(source: str, write: Callable[[str], None]) -> str:
     """Writes the workbook and returns its download URL; prunes expired exports."""
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     cutoff = time.time() - EXPORT_TTL_HOURS * 3600
@@ -310,34 +336,14 @@ def export_xlsx(source: str, sheets: list[tuple[str, tables.Table]]) -> str:
     token = uuid.uuid4().hex
     name = re.sub(r'[\\/:*?"<>|]', "_", source) + ".xlsx"
     (EXPORT_DIR / token).mkdir()
-    tables.write_xlsx(str(EXPORT_DIR / token / name), sheets)
+    write(str(EXPORT_DIR / token / name))
     return f"{PUBLIC_BASE_URL}/exports/{token}/{quote(name)}"
 
 
-async def run_ocr(body: dict, images: list[dict], prompt: str, source: str, headers: dict) -> Response:
+async def respond(body: dict, pieces: Callable[[], AsyncIterator[str]], usage: dict) -> Response:
+    """Wraps generated text pieces as an OpenAI chat completion (streamed or not)."""
     model = body["model"]
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    multi = len(images) > 1
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-    async def pieces():
-        # Pages are buffered so their HTML tables can be converted as a whole
-        sheets: list[tuple[str, tables.Table]] = []
-        for i, img in enumerate(images, 1):
-            raw = "".join([t async for t in ocr_page(model, img, prompt, headers, usage)])
-            text, found = tables.convert_html_tables(raw)
-            for n, t in enumerate(found, 1):
-                sheets.append((f"Page{i}" + (f"_{n}" if len(found) > 1 else ""), t))
-            heading = f"## Page {i}\n\n" if multi else ""
-            yield ("\n\n" if i > 1 else "") + heading + text
-        if sheets:
-            try:
-                url = export_xlsx(source, sheets)
-                log.info("exported %d table(s) to %s", len(sheets), url)
-                yield f"\n\n---\n\n📥 [Excelでダウンロード ({len(sheets)}表)]({url})"
-            except Exception:
-                log.exception("xlsx export failed")
-                yield "\n\n---\n\n(Excelファイルの作成に失敗しました)"
 
     if not body.get("stream"):
         content = "".join([t async for t in pieces()])
@@ -362,6 +368,89 @@ async def run_ocr(body: dict, images: list[dict], prompt: str, source: str, head
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def new_usage() -> dict:
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+async def run_ocr(body: dict, images: list[dict], prompt: str, source: str, headers: dict) -> Response:
+    model = body["model"]
+    multi = len(images) > 1
+    usage = new_usage()
+
+    async def pieces():
+        # Pages are buffered so their HTML tables can be converted as a whole
+        sheets: list[tuple[str, tables.Table]] = []
+        for i, img in enumerate(images, 1):
+            raw = await ocr_text(model, img, prompt, headers, usage)
+            text, found = tables.convert_html_tables(raw)
+            for n, t in enumerate(found, 1):
+                sheets.append((f"Page{i}" + (f"_{n}" if len(found) > 1 else ""), t))
+            heading = f"## Page {i}\n\n" if multi else ""
+            yield ("\n\n" if i > 1 else "") + heading + text
+        if sheets:
+            try:
+                url = export_xlsx(source, lambda path: tables.write_xlsx(path, sheets))
+                log.info("exported %d table(s) to %s", len(sheets), url)
+                yield f"\n\n---\n\n📥 [Excelでダウンロード ({len(sheets)}表)]({url})"
+            except Exception:
+                log.exception("xlsx export failed")
+                yield "\n\n---\n\n(Excelファイルの作成に失敗しました)"
+
+    return await respond(body, pieces, usage)
+
+
+async def run_format(body: dict, images: list[dict], request_text: str, source: str, headers: dict) -> Response:
+    """Workflow: OCR all pages -> merge -> LLM reshape to template -> rule checks -> table + Excel."""
+    template = formatter.parse_template(request_text)
+    usage = new_usage()
+
+    async def pieces():
+        yield (f"**OCR→整形**: {len(images)}ページを読み取り、`{formatter.FORMAT_LLM}` で "
+               f"「{'・'.join(template)}」の表に整形します。\n\n")
+        pages: list[list[tables.Table]] = []
+        originals: list[tuple[str, tables.Table]] = []
+        for i, img in enumerate(images, 1):
+            raw = await ocr_text(OCR_FALLBACK_MODEL, img, "Table Recognition:", headers, usage)
+            _, found = tables.convert_html_tables(raw)
+            pages.append(found)
+            originals += [(f"P{i}" + (f"_{n}" if len(found) > 1 else ""), t) for n, t in enumerate(found, 1)]
+            rows = sum(max(len(t.rows) - 1, 0) for t in found)
+            yield f"- {i}ページ目を読み取りました（表 {len(found)} 個・約 {rows} 行）\n"
+
+        columns, source_rows = formatter.merge_pages(pages)
+        if not source_rows:
+            yield "\n表を読み取れませんでした。ページの向きや解像度（PDF_DPI）を確認してください。"
+            return
+
+        shaped: dict[int, dict] = {}
+        indexed = list(enumerate(source_rows))
+        batches = [indexed[k:k + formatter.FORMAT_BATCH_ROWS]
+                   for k in range(0, len(indexed), formatter.FORMAT_BATCH_ROWS)]
+        for b, batch in enumerate(batches, 1):
+            try:
+                shaped |= await formatter.reshape_batch(client, UPSTREAM, headers, template, columns, batch)
+            except Exception:
+                log.exception("format batch %d failed", b)
+            yield f"- 整形 {b}/{len(batches)}（{len(batch)} 行）が終わりました\n"
+
+        result = formatter.finalize(template, source_rows, shaped, columns)
+        counts = {k: sum(1 for i in result.issues if i.kind == k) for k in formatter.MARKS}
+        summary = "・".join(f"{k} {v}件" for k, v in counts.items() if v) or "なし"
+        yield (f"\n### 整形結果（{len(result.rows)} 行）\n\n{formatter.to_markdown(result)}\n\n"
+               f"✎ = LLMが補正した値、⚠ = 要確認（{summary}）\n\n"
+               f"#### 確認が必要な箇所\n\n{formatter.issues_markdown(result)}")
+        try:
+            url = export_xlsx(source + "_整形済み",
+                              lambda path: formatter.write_workbook(path, result, originals))
+            log.info("format export: rows=%d issues=%d -> %s", len(result.rows), len(result.issues), url)
+            yield (f"\n\n---\n\n📥 [Excelでダウンロード（整形済み・確認リスト・OCR原本）]({url})")
+        except Exception:
+            log.exception("xlsx export failed")
+            yield "\n\n---\n\n(Excelファイルの作成に失敗しました)"
+
+    return await respond(body, pieces, usage)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -404,6 +493,18 @@ async def chat_completions(request: Request) -> Response:
         for m in body.get("messages", [])
     )
 
+    if model == formatter.FORMAT_MODEL_NAME:
+        built = build_ocr_jobs(body)
+        if built:
+            images, _, source = built
+            users = [m for m in body["messages"] if m.get("role") == "user"]
+            log.info("FORMAT pages=%d llm=%s", len(images), formatter.FORMAT_LLM)
+            return await run_format(body, images, message_text(users[-1]["content"]), source,
+                              forward_headers(request))
+        # Follow-up turns (and title generation) are answered by the formatting LLM
+        body["model"] = model = formatter.FORMAT_LLM
+        raw = json.dumps(body).encode()
+
     if is_ocr_model(model):
         built = build_ocr_jobs(body)
         if built:
@@ -417,6 +518,15 @@ async def chat_completions(request: Request) -> Response:
         raw = json.dumps(body).encode()
 
     return await passthrough(request, raw)
+
+
+async def list_models(request: Request) -> Response:
+    """Ollama's model list plus the virtual OCR→format workflow model."""
+    r = await client.get(f"{UPSTREAM}/v1/models", headers=forward_headers(request))
+    data = r.json()
+    data.setdefault("data", []).append({"id": formatter.FORMAT_MODEL_NAME, "object": "model",
+                                        "created": int(time.time()), "owned_by": "ocr-bridge"})
+    return JSONResponse(data, status_code=r.status_code)
 
 
 async def any_route(request: Request) -> Response:
@@ -442,5 +552,6 @@ app = Starlette(routes=[
     Route("/healthz", health),
     Route("/exports/{token}/{name}", download, methods=["GET"]),
     Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+    Route("/v1/models", list_models, methods=["GET"]),
     Route("/{path:path}", any_route, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
 ])

@@ -27,6 +27,11 @@ services:
       - EXPORT_TTL_HOURS=72
       # Infer missing column headers (日付, 姓, 名, 郵便番号, 住所, 電話番号)
       - TABLE_AUTO_HEADER=true
+      # "ocr-format" workflow model: OCR -> merge pages -> LLM reshape -> checks
+      - FORMAT_MODEL_NAME=ocr-format
+      - FORMAT_LLM=nemotron-nano-9b-ja:latest
+      - FORMAT_TEMPLATE=日付,姓,名,郵便番号,住所,電話番号,備考
+      - FORMAT_BATCH_ROWS=15
     ports:
       # Localhost only: serves the /exports download links to this machine's browser
       - "127.0.0.1:3082:8080"

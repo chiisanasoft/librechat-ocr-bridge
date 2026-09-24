@@ -144,27 +144,31 @@ def write_xlsx(path: str, sheets: list[tuple[str, Table]]) -> None:
     """One worksheet per (name, table); spans are kept as merged cells."""
     wb = Workbook()
     wb.remove(wb.active)
+    for name, table in sheets:
+        add_table_sheet(wb, name, table)
+    wb.save(path)
+
+
+def add_table_sheet(wb: Workbook, name: str, table: Table) -> None:
     thin = Side(style="thin", color="999999")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for name, table in sheets:
-        ws = wb.create_sheet(_sheet_title(name, wb.sheetnames))
-        grid, merges = table.grid()
-        header_rows = {r for r, row in enumerate(table.rows) if row and all(c.header for c in row)}
-        widths: dict[int, int] = {}
-        for r, row in enumerate(grid, 1):
-            for c, value in enumerate(row, 1):
-                cell = ws.cell(row=r, column=c, value=_typed(unescape(value)))
-                cell.border = border
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-                if r - 1 in header_rows:
-                    cell.font = Font(bold=True)
-                longest = max((_display_width(s) for s in value.split("\n")), default=0)
-                widths[c] = max(widths.get(c, 0), longest)
-        for r1, c1, r2, c2 in merges:
-            ws.merge_cells(start_row=r1 + 1, start_column=c1 + 1, end_row=r2 + 1, end_column=c2 + 1)
-        for c, w in widths.items():
-            ws.column_dimensions[get_column_letter(c)].width = min(max(w + 2, 6), 60)
-    wb.save(path)
+    ws = wb.create_sheet(_sheet_title(name, wb.sheetnames))
+    grid, merges = table.grid()
+    header_rows = {r for r, row in enumerate(table.rows) if row and all(c.header for c in row)}
+    widths: dict[int, int] = {}
+    for r, row in enumerate(grid, 1):
+        for c, value in enumerate(row, 1):
+            cell = ws.cell(row=r, column=c, value=_typed(unescape(value)))
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            if r - 1 in header_rows:
+                cell.font = Font(bold=True)
+            longest = max((_display_width(s) for s in value.split("\n")), default=0)
+            widths[c] = max(widths.get(c, 0), longest)
+    for r1, c1, r2, c2 in merges:
+        ws.merge_cells(start_row=r1 + 1, start_column=c1 + 1, end_row=r2 + 1, end_column=c2 + 1)
+    for c, w in widths.items():
+        ws.column_dimensions[get_column_letter(c)].width = min(max(w + 2, 6), 60)
 
 
 def _typed(value: str):
