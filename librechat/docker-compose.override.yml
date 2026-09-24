@@ -1,0 +1,37 @@
+# Copy into your LibreChat checkout. Assumes this repo sits next to it:
+#   ./LibreChat/                 (official repo)
+#   ./librechat-ocr-bridge/      (this repo)
+services:
+  api:
+    volumes:
+      - type: bind
+        source: ./librechat.yaml
+        target: /app/librechat.yaml
+
+  # PDF -> image/text conversion proxy in front of the host's Ollama
+  ollama-proxy:
+    container_name: ollama-proxy
+    build: ../librechat-ocr-bridge/proxy
+    image: librechat-ollama-proxy:local
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_UPSTREAM=http://host.docker.internal:11434
+      - OCR_MODELS=glm-ocr
+      - PDF_DPI=200
+      - PDF_MAX_PAGES=20
+      - OCR_MAX_TOKENS=8192
+      # Excel exports of OCR'd tables (download links in chat replies)
+      - PUBLIC_BASE_URL=http://localhost:3082
+      - EXPORT_TTL_HOURS=72
+      # Infer missing column headers (日付, 姓, 名, 郵便番号, 住所, 電話番号)
+      - TABLE_AUTO_HEADER=true
+    ports:
+      # Localhost only: serves the /exports download links to this machine's browser
+      - "127.0.0.1:3082:8080"
+    volumes:
+      - ollama-proxy-exports:/data/exports
+
+volumes:
+  ollama-proxy-exports:
