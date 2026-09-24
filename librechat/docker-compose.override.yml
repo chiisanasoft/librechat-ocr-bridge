@@ -29,7 +29,10 @@ services:
       - TABLE_AUTO_HEADER=true
       # "ocr-format" workflow model: OCR -> merge pages -> LLM reshape -> checks
       - FORMAT_MODEL_NAME=ocr-format
-      - FORMAT_LLM=nemotron-nano-9b-ja:latest
+      # Model used for reshaping; must support structured (JSON schema) output.
+      # Leave empty to disable ocr-format. Example: FORMAT_LLM=qwen3:8b
+      - FORMAT_LLM=
+      # Output columns; adjust to your documents
       - FORMAT_TEMPLATE=日付,姓,名,郵便番号,住所,電話番号,備考
       - FORMAT_BATCH_ROWS=15
     ports:

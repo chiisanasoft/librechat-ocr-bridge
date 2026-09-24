@@ -13,8 +13,7 @@ endpoints:
       baseURL: "http://ollama-proxy:8080/v1/"
       models:
         default:
-          - "nemotron-nano-9b-ja:latest"
-          - "nemotron-nano-9b-ja-agent:latest"
+          - "glm-ocr:latest"
         # Fetch the model list from Ollama automatically
         fetch: true
       titleConvo: true

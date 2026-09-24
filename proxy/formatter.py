@@ -26,7 +26,9 @@ from openpyxl.utils import get_column_letter
 import tables
 
 FORMAT_MODEL_NAME = os.environ.get("FORMAT_MODEL_NAME", "ocr-format")
-FORMAT_LLM = os.environ.get("FORMAT_LLM", "nemotron-nano-9b-ja:latest")
+# Model that reshapes rows; must support JSON-schema structured output. Empty disables the workflow.
+FORMAT_LLM = os.environ.get("FORMAT_LLM", "").strip()
+# Example default for address-book style ledgers; set FORMAT_TEMPLATE for your documents
 FORMAT_TEMPLATE = [c.strip() for c in os.environ.get(
     "FORMAT_TEMPLATE", "日付,姓,名,郵便番号,住所,電話番号,備考").split(",") if c.strip()]
 FORMAT_BATCH_ROWS = int(os.environ.get("FORMAT_BATCH_ROWS", "15"))

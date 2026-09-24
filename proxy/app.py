@@ -494,6 +494,9 @@ async def chat_completions(request: Request) -> Response:
     )
 
     if model == formatter.FORMAT_MODEL_NAME:
+        if not formatter.FORMAT_LLM:
+            return JSONResponse({"error": {"message": "FORMAT_LLM is not set; the ocr-format workflow is disabled",
+                                           "type": "invalid_request_error"}}, status_code=400)
         built = build_ocr_jobs(body)
         if built:
             images, _, source = built
@@ -524,8 +527,9 @@ async def list_models(request: Request) -> Response:
     """Ollama's model list plus the virtual OCR→format workflow model."""
     r = await client.get(f"{UPSTREAM}/v1/models", headers=forward_headers(request))
     data = r.json()
-    data.setdefault("data", []).append({"id": formatter.FORMAT_MODEL_NAME, "object": "model",
-                                        "created": int(time.time()), "owned_by": "ocr-bridge"})
+    if formatter.FORMAT_LLM:
+        data.setdefault("data", []).append({"id": formatter.FORMAT_MODEL_NAME, "object": "model",
+                                            "created": int(time.time()), "owned_by": "ocr-bridge"})
     return JSONResponse(data, status_code=r.status_code)
 
 
@@ -533,6 +537,8 @@ async def list_tags(request: Request) -> Response:
     """Ollama-native model list; LibreChat uses this for endpoints named "Ollama"."""
     r = await client.get(f"{UPSTREAM}/api/tags", headers=forward_headers(request))
     data = r.json()
+    if not formatter.FORMAT_LLM:
+        return JSONResponse(data, status_code=r.status_code)
     data.setdefault("models", []).append({
         "name": formatter.FORMAT_MODEL_NAME, "model": formatter.FORMAT_MODEL_NAME,
         "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "size": 0, "digest": "",
